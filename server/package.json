@@ -6,6 +6,7 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node ./src/app.js",
+    "create-admin": "node scripts/create-admin.js",
     "dev": "nodemon ./src/app.js --ext js,txt",
     "db:create": "npx sequelize db:create",
     "db:drop": "npx sequelize db:drop",
@@ -30,6 +31,7 @@
     "https": "^1.0.0",
     "jsonwebtoken": "^9.0.3",
     "morgan": "^1.10.1",
+    "multer": "^2.1.1",
     "nodemon": "^3.1.14",
     "pg": "^8.19.0",
     "pg-hstore": "^2.3.4",

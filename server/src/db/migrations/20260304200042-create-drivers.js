@@ -11,7 +11,7 @@ module.exports = {
       END $$;
     `);
 
-    // Создаем таблицу drivers
+    // Создаем таблицу drivers со ВСЕМИ полями
     await queryInterface.createTable("drivers", {
       id: {
         type: Sequelize.UUID,
@@ -45,6 +45,61 @@ module.exports = {
         type: Sequelize.BOOLEAN,
         defaultValue: true,
       },
+
+      // ============= НОВЫЕ ПОЛЯ =============
+      vehicle_license_plate: {
+        type: Sequelize.STRING,
+        allowNull: true,
+      },
+      vehicle_model: {
+        type: Sequelize.STRING,
+        allowNull: true,
+      },
+      vehicle_year: {
+        type: Sequelize.INTEGER,
+        allowNull: true,
+      },
+      inspection_date: {
+        type: Sequelize.DATEONLY,
+        allowNull: true,
+      },
+      next_inspection_date: {
+        type: Sequelize.DATEONLY,
+        allowNull: true,
+      },
+      permit_valid_from: {
+        type: Sequelize.DATEONLY,
+        allowNull: true,
+      },
+      permit_valid_until: {
+        type: Sequelize.DATEONLY,
+        allowNull: true,
+      },
+      insurance_valid_from: {
+        type: Sequelize.DATEONLY,
+        allowNull: true,
+      },
+      insurance_valid_until: {
+        type: Sequelize.DATEONLY,
+        allowNull: true,
+      },
+      inspection_notified: {
+        type: Sequelize.BOOLEAN,
+        defaultValue: false,
+      },
+      permit_notified: {
+        type: Sequelize.BOOLEAN,
+        defaultValue: false,
+      },
+      insurance_notified: {
+        type: Sequelize.BOOLEAN,
+        defaultValue: false,
+      },
+      last_notification_date: {
+        type: Sequelize.DATE,
+        allowNull: true,
+      },
+
       created_at: {
         type: Sequelize.DATE,
         allowNull: false,
@@ -62,12 +117,15 @@ module.exports = {
     await queryInterface.addIndex("drivers", ["driver_type"]);
     await queryInterface.addIndex("drivers", ["user_id"]);
     await queryInterface.addIndex("drivers", ["is_active"]);
+    await queryInterface.addIndex("drivers", ["next_inspection_date"]);
+    await queryInterface.addIndex("drivers", ["permit_valid_until"]);
+    await queryInterface.addIndex("drivers", ["insurance_valid_until"]);
   },
 
   down: async (queryInterface, Sequelize) => {
     await queryInterface.dropTable("drivers");
-    await queryInterface.sequelize.query(`
-      DROP TYPE IF EXISTS enum_drivers_driver_type;
-    `);
+    await queryInterface.sequelize.query(
+      "DROP TYPE IF EXISTS enum_drivers_driver_type;",
+    );
   },
 };
