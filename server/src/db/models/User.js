@@ -180,6 +180,19 @@ module.exports = (sequelize) => {
         defaultValue: true,
         field: "is_active",
       },
+      email_verified: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: false,
+      },
+      verification_code: {
+        type: DataTypes.STRING(6),
+        allowNull: true,
+      },
+      verification_code_expires_at: {
+        type: DataTypes.DATE,
+        allowNull: true,
+      },
     },
     {
       sequelize,

@@ -9,30 +9,14 @@ class AuthController {
     try {
       const { email, phone, password, full_name, role = "user" } = req.body;
 
-      // Используем signUp из сервиса
-      const user = await UserService.signUp({
-        email,
-        phone,
-        password,
-        full_name,
-        role,
-      });
+      const user = await UserService.signUp({ email, phone, password, full_name, role });
 
-      // Генерируем токены
-      const payload = {
-        id: user.id,
-        email: user.email,
-        full_name: user.full_name,
-        role: user.role,
-      };
+      const message = user.email_sent
+        ? "Регистрация прошла успешно. Код подтверждения отправлен на вашу почту"
+        : "Регистрация прошла успешно, но письмо не удалось отправить. Используйте повторную отправку кода";
 
-      const { accessToken, refreshToken } = generateJWTTokens(payload);
-
-      res.status(201).cookie("refreshToken", refreshToken, cookieConfig).json(
-        formatResponse.created("Пользователь успешно зарегистрирован", {
-          accessToken,
-          user,
-        }),
+      return res.status(201).json(
+        formatResponse.created(message, { email: user.email, email_sent: user.email_sent }),
       );
     } catch (error) {
       console.log("Ошибка регистрации:", error);
@@ -45,9 +29,62 @@ class AuthController {
         statusCode = 400;
       }
 
-      res
-        .status(statusCode)
-        .json(formatResponse.error(error.message, null, statusCode));
+      return res.status(statusCode).json(formatResponse.error(error.message, null, statusCode));
+    }
+  }
+
+  // * Подтверждение email по коду
+  static async verifyEmail(req, res) {
+    try {
+      const { email, code } = req.body;
+
+      if (!email || !code) {
+        return res.status(400).json(formatResponse.error("email и code обязательны"));
+      }
+
+      const user = await UserService.verifyEmail(email, code);
+
+      const payload = {
+        id: user.id,
+        email: user.email,
+        full_name: user.full_name,
+        role: user.role,
+      };
+
+      const { accessToken, refreshToken } = generateJWTTokens(payload);
+
+      return res.status(200).cookie("refreshToken", refreshToken, cookieConfig).json(
+        formatResponse.success("Email подтверждён. Добро пожаловать!", { accessToken, user }),
+      );
+    } catch (error) {
+      console.log("Ошибка подтверждения email:", error);
+
+      const statusCode =
+        error.message.includes("не найден") ? 404 :
+        error.message.includes("истёк") || error.message.includes("Неверный") ? 400 :
+        500;
+
+      return res.status(statusCode).json(formatResponse.error(error.message, null, statusCode));
+    }
+  }
+
+  // * Повторная отправка кода
+  static async resendCode(req, res) {
+    try {
+      const { email } = req.body;
+
+      if (!email) {
+        return res.status(400).json(formatResponse.error("email обязателен"));
+      }
+
+      await UserService.resendCode(email);
+
+      return res.json(formatResponse.success("Новый код отправлен на почту"));
+    } catch (error) {
+      console.log("Ошибка повторной отправки кода:", error);
+
+      const statusCode = error.message.includes("не найден") ? 404 : 400;
+      return res.status(statusCode).json(formatResponse.error(error.message, null, statusCode));
     }
   }
 
@@ -89,6 +126,14 @@ class AuthController {
       );
     } catch (error) {
       console.log("Ошибка входа:", error);
+
+      if (error.code === "EMAIL_NOT_VERIFIED") {
+        return res.status(403).json({
+          success: false,
+          message: error.message,
+          code: "EMAIL_NOT_VERIFIED",
+        });
+      }
 
       let statusCode = 401;
       if (error.message.includes("не найден")) {

@@ -1,0 +1,14 @@
+{
+  "name": "stroylogistics",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "npm run dev --prefix server",
+    "start": "npm start --prefix server",
+    "db:init": "npm run db:init --prefix server",
+    "db:mig": "npm run db:mig --prefix server",
+    "db:mig:undo": "npm run db:mig:undo --prefix server",
+    "db:seed": "npm run db:seed --prefix server",
+    "create-admin": "npm run create-admin --prefix server",
+    "test": "npm test --prefix server"
+  }
+}

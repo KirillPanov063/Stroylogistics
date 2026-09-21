@@ -6,6 +6,7 @@ const path = require("path");
 const fs = require("fs");
 const serverConfig = require("./config/serverConfig");
 const indexRouter = require("./routes/index.router");
+const startCronJobs = require("./cron");
 
 // Импортируем модели
 const { sequelize } = require("./db/models");
@@ -24,6 +25,7 @@ const uploadDirs = [
   path.join(__dirname, "uploads"),
   path.join(__dirname, "uploads/temp"),
   path.join(__dirname, "uploads/documents"),
+  path.join(__dirname, "uploads/photos"),
 ];
 
 uploadDirs.forEach((dir) => {
@@ -95,6 +97,7 @@ sequelize
       console.log(
         `📁 Загрузки сохраняются в: ${path.join(__dirname, "uploads")}`,
       );
+      startCronJobs();
     });
   })
   .catch((err) => {

@@ -50,6 +50,18 @@ module.exports = (sequelize) => {
         comment: "ID связанного объекта",
       },
 
+      waste_receiver_id: {
+        type: DataTypes.UUID,
+        allowNull: true,
+        references: {
+          model: "waste_receivers",
+          key: "id",
+        },
+        onDelete: "SET NULL",
+        onUpdate: "CASCADE",
+        comment: "ID компании-приёмщика мусора",
+      },
+
       parent_document_id: {
         type: DataTypes.UUID,
         allowNull: true,

@@ -25,8 +25,9 @@ module.exports = (sequelize) => {
           "processing", // В обработке - заказ принят, ищут исполнителя
           "assigned", // Назначен - исполнитель назначен
           "in_transit", // В пути - выполняется доставка/забор
+          "driver_done", // Водитель выполнил - ждём оплату
           "paid", // Оплачен - оплата получена
-          "completed", // Завершен - услуга оказана полностью
+          "completed", // Завершен - водитель выполнил И оплата получена
           "cancelled", // Отменен - заказ отменён
         ),
         defaultValue: "draft",
@@ -108,9 +109,11 @@ module.exports = (sequelize) => {
 
       container_action: {
         type: DataTypes.ENUM(
-          "install", // Установка контейнера
-          "pickup", // Забор контейнера
-          "loading", // Загрузка/выгрузка
+          "install",   // Постановка
+          "pickup",    // Забрать
+          "loading",   // Загрузка
+          "replace",   // Замена
+          "roll",      // Откатать
         ),
         allowNull: true,
         comment: "Действие с контейнером: установка, забор, загрузка",
@@ -375,12 +378,102 @@ module.exports = (sequelize) => {
         comment: "Дата отметки о просрочке платежа",
       },
 
+      // ============= СПОСОБ ОПЛАТЫ ИСПОЛНИТЕЛЮ =============
+
+      executor_payment_method: {
+        type: DataTypes.ENUM(
+          "invoice_with_vat",
+          "invoice_without_vat",
+          "cash",
+          "card_transfer",
+        ),
+        allowNull: true,
+        comment: "Как мы платим исполнителю (только для заказов с исполнителем)",
+      },
+
+      // ============= НЕТТО-СУММЫ ПОСЛЕ НДС =============
+
+      client_amount_net: {
+        type: DataTypes.DECIMAL(10, 2),
+        allowNull: true,
+        comment: "Нетто от клиента: client_amount * 0.78 если invoice_with_vat, иначе = client_amount",
+      },
+
+      executor_amount_net: {
+        type: DataTypes.DECIMAL(10, 2),
+        allowNull: true,
+        comment: "Нетто исполнителю: executor_amount * 0.78 если invoice_with_vat, иначе = executor_amount",
+      },
+
+      // ============= ПОЛУЧАТЕЛЬ НАЛИЧНЫХ/КАРТЫ =============
+
+      income_recipient_user_id: {
+        type: DataTypes.UUID,
+        allowNull: true,
+        references: { model: "users", key: "id" },
+        onDelete: "SET NULL",
+        onUpdate: "CASCADE",
+        comment: "Сотрудник, принявший оплату наличными/картой (идёт в зарплату)",
+      },
+
+      payment_flow: {
+        type: DataTypes.ENUM("direct", "executor_collects"),
+        allowNull: false,
+        defaultValue: "direct",
+        comment: "direct — клиент платит компании; executor_collects — исполнитель собирает всё и отправляет комиссию",
+      },
+
+      is_loss_acknowledged: {
+        type: DataTypes.BOOLEAN,
+        defaultValue: false,
+        comment: "Менеджер подтвердил убыточную операцию (сценарии 4 и 5)",
+      },
+
+      distance_multiplier: {
+        type: DataTypes.DECIMAL(4, 2),
+        allowNull: false,
+        defaultValue: 1.0,
+        comment: "Коэффициент дальности для штатного водителя (1, 1.5, 2 и т.д.)",
+      },
+
+      driver_completed_at: {
+        type: DataTypes.DATE,
+        allowNull: true,
+        comment: "Дата и время когда водитель отправил отчёт о выполнении",
+      },
+
+      // ============= ПОЛИГОН СГРУЗКИ =============
+
+      waste_receiver_id: {
+        type: DataTypes.UUID,
+        allowNull: true,
+        references: { model: "waste_receivers", key: "id" },
+        onDelete: "SET NULL",
+        onUpdate: "CASCADE",
+        comment: "Компания-приёмщик мусора (для загрузки, забора, замены)",
+      },
+
+      waste_receiver_address_id: {
+        type: DataTypes.UUID,
+        allowNull: true,
+        references: { model: "waste_receiver_addresses", key: "id" },
+        onDelete: "SET NULL",
+        onUpdate: "CASCADE",
+        comment: "Конкретный адрес сгрузки на полигоне",
+      },
+
       // ============= ФОТО ВЫПОЛНЕНИЯ =============
 
       completion_photo: {
         type: DataTypes.STRING,
         allowNull: true,
         comment: "Путь к фото выполнения",
+      },
+
+      waybill_photo: {
+        type: DataTypes.STRING,
+        allowNull: true,
+        comment: "Путь к фото накладной (обязательно для юр. лиц с оплатой по счёту)",
       },
 
       // ============= УВЕДОМЛЕНИЯ =============
@@ -422,121 +515,11 @@ module.exports = (sequelize) => {
       updatedAt: "updated_at",
       hooks: {
         beforeValidate: (order) => {
-          // ============= ПРОПУСК ВАЛИДАЦИИ ДЛЯ ОБНОВЛЕНИЯ СТАТУСА =============
-          // Если установлен флаг _skipStatusValidation, пропускаем всю валидацию
-          if (order._skipStatusValidation) {
-            return;
-          }
-
-          // ============= СИНХРОНИЗАЦИЯ ПОЛЕЙ =============
-          // Если заполнен client_amount, синхронизируем payment_amount
-          if (
-            order.client_amount !== undefined &&
-            order.client_amount !== null
-          ) {
+          // Синхронизация client_amount <-> payment_amount
+          if (order.client_amount != null) {
             order.payment_amount = order.client_amount;
-          }
-          // Если заполнен payment_amount, а client_amount нет, синхронизируем обратно
-          if (
-            (order.client_amount === undefined ||
-              order.client_amount === null) &&
-            order.payment_amount !== undefined &&
-            order.payment_amount !== null
-          ) {
+          } else if (order.payment_amount != null) {
             order.client_amount = order.payment_amount;
-          }
-
-          // ============= ПРОВЕРКА НАЛИЧИЯ ИСПОЛНИТЕЛЯ =============
-          const hasDriver =
-            order.driver_id !== null && order.driver_id !== undefined;
-          const hasExecutor =
-            order.executor_id !== null && order.executor_id !== undefined;
-
-          if (!hasDriver && !hasExecutor) {
-            throw new Error(
-              "Должен быть указан либо водитель, либо исполнитель",
-            );
-          }
-
-          if (hasDriver && hasExecutor) {
-            throw new Error(
-              "Нельзя указать одновременно и водителя, и исполнителя",
-            );
-          }
-
-          // ============= ВАЛИДАЦИЯ ДЛЯ ВОДИТЕЛЯ (сотрудник компании) =============
-          if (hasDriver) {
-            // executor_amount и commission_amount не должны быть заполнены
-            if (order.executor_amount !== null && order.executor_amount !== 0) {
-              throw new Error(
-                "Для заказа с водителем компании сумма исполнителю должна быть 0 или null",
-              );
-            }
-            if (
-              order.commission_amount !== null &&
-              order.commission_amount !== 0
-            ) {
-              throw new Error(
-                "Для заказа с водителем компании комиссия должна быть 0 или null",
-              );
-            }
-
-            // Если client_amount не указан, устанавливаем 0
-            if (
-              order.client_amount === undefined ||
-              order.client_amount === null
-            ) {
-              order.client_amount = 0;
-            }
-
-            // Синхронизация payment_amount
-            order.payment_amount = order.client_amount;
-          }
-
-          // ============= ВАЛИДАЦИЯ ДЛЯ ИСПОЛНИТЕЛЯ (внешний подрядчик) =============
-          if (hasExecutor) {
-            // client_amount обязателен
-            if (!order.client_amount || order.client_amount <= 0) {
-              throw new Error(
-                "Для внешнего исполнителя необходимо указать сумму от клиента",
-              );
-            }
-            // executor_amount обязателен
-            if (!order.executor_amount || order.executor_amount <= 0) {
-              throw new Error(
-                "Для внешнего исполнителя необходимо указать сумму исполнителю",
-              );
-            }
-            // commission_amount обязателен
-            if (
-              order.commission_amount === null ||
-              order.commission_amount === undefined
-            ) {
-              throw new Error(
-                "Для внешнего исполнителя необходимо указать сумму комиссии",
-              );
-            }
-            // Проверка арифметики
-            if (
-              Number(order.client_amount) !==
-              Number(order.executor_amount) + Number(order.commission_amount)
-            ) {
-              throw new Error(
-                "Сумма от клиента должна равняться сумме исполнителю плюс комиссия",
-              );
-            }
-          }
-
-          // ============= ВАЛИДАЦИЯ ДЛЯ ПРЕДОПЛАТЫ =============
-          if (order.payment_format === "prepaid") {
-            if (
-              !order.prepaid_deliveries_total ||
-              order.prepaid_deliveries_total <= 0
-            ) {
-              throw new Error(
-                "Для предоплаты необходимо указать количество доставок",
-              );
-            }
           }
         },
       },
@@ -572,19 +555,7 @@ module.exports = (sequelize) => {
         {
           fields: ["payment_format"],
         },
-        {
-          fields: ["client_amount"],
-        },
-        {
-          fields: ["executor_amount"],
-        },
-        {
-          fields: ["commission_amount"],
-        },
-        {
-          fields: ["payment_amount"],
-        },
-        // Новые индексы для работы со счетами
+        // Индексы для работы со счетами
         {
           fields: ["executor_invoice_status"],
         },

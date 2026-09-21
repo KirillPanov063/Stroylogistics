@@ -6,6 +6,8 @@ const {
   sequelize,
 } = require("../db/models");
 const { Op } = require("sequelize");
+const PriceService = require("./PriceService");
+const SalaryService = require("./SalaryService");
 
 class OrderService {
   // ============= ВАЛИДАЦИЯ =============
@@ -157,6 +159,14 @@ class OrderService {
       };
     }
 
+    // executor_collects требует исполнителя
+    if (data.payment_flow === "executor_collects" && !hasExecutor) {
+      return {
+        isValid: false,
+        error: "Схема 'исполнитель собирает' доступна только при назначении исполнителя",
+      };
+    }
+
     // Валидация для предоплаченного пакета
     if (payment_format === "prepaid") {
       if (!prepaid_deliveries_total || prepaid_deliveries_total <= 0) {
@@ -178,27 +188,14 @@ class OrderService {
   static async getAll(filters = {}) {
     const where = {};
 
-    if (filters.status) {
-      where.status = filters.status;
-    }
-    if (filters.customer_id) {
-      where.customer_id = filters.customer_id;
-    }
-    if (filters.driver_id) {
-      where.driver_id = filters.driver_id;
-    }
-    if (filters.executor_id) {
-      where.executor_id = filters.executor_id;
-    }
-    if (filters.user_id) {
-      where.user_id = filters.user_id;
-    }
-    if (filters.payment_format) {
-      where.payment_format = filters.payment_format;
-    }
-    if (filters.payment_type) {
-      where.payment_type = filters.payment_type;
-    }
+    if (filters.status) where.status = filters.status;
+    if (filters.customer_id) where.customer_id = filters.customer_id;
+    if (filters.driver_id) where.driver_id = filters.driver_id;
+    if (filters.executor_id) where.executor_id = filters.executor_id;
+    if (filters.user_id) where.user_id = filters.user_id;
+    if (filters.payment_format) where.payment_format = filters.payment_format;
+    if (filters.payment_type) where.payment_type = filters.payment_type;
+
     if (filters.date_from || filters.date_to) {
       where.created_at = {};
       if (filters.date_from) {
@@ -209,7 +206,11 @@ class OrderService {
       }
     }
 
-    const orders = await Order.findAll({
+    const page = Math.max(1, parseInt(filters.page) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(filters.limit) || 50));
+    const offset = (page - 1) * limit;
+
+    const { count, rows } = await Order.findAndCountAll({
       where,
       include: [
         {
@@ -242,9 +243,19 @@ class OrderService {
         },
       ],
       order: [["created_at", "DESC"]],
+      limit,
+      offset,
     });
 
-    return orders.map((o) => o.get({ plain: true }));
+    return {
+      data: rows.map((o) => o.get({ plain: true })),
+      pagination: {
+        total: count,
+        page,
+        limit,
+        total_pages: Math.ceil(count / limit),
+      },
+    };
   }
 
   static async getById(id) {
@@ -309,6 +320,40 @@ class OrderService {
   }
 
   static async create(data, userId) {
+    // Автоподстановка client_amount из прайс-карточки клиента, если не указана
+    if (
+      data.executor_id &&
+      !data.client_amount &&
+      data.container_volume &&
+      data.payment_type &&
+      data.customer_id
+    ) {
+      try {
+        const priceInfo = await PriceService.getPriceForCustomer(
+          data.customer_id,
+          data.container_volume,
+          data.payment_type,
+        );
+        data = { ...data, client_amount: priceInfo.price };
+      } catch {
+        // У клиента нет настроенных цен — продолжаем без автоподстановки
+      }
+    }
+
+    // Автовычисление commission_amount = client_amount - executor_amount
+    if (
+      data.executor_id &&
+      data.client_amount > 0 &&
+      data.executor_amount > 0 &&
+      data.commission_amount == null
+    ) {
+      data = {
+        ...data,
+        commission_amount:
+          parseFloat(data.client_amount) - parseFloat(data.executor_amount),
+      };
+    }
+
     const validation = this.validateOrderData(data);
     if (!validation.isValid) {
       throw new Error(validation.error);
@@ -335,13 +380,29 @@ class OrderService {
       client_amount,
       executor_amount,
       commission_amount,
+      executor_payment_method,
+      income_recipient_user_id,
+      is_loss_acknowledged,
       payment_format,
       prepaid_deliveries_total,
       payment_confirmation_file,
       completion_photo,
       comments,
       status = "draft",
+      distance_multiplier,
+      payment_flow = "direct",
     } = data;
+
+    // Коэффициент дальности — только для штатных водителей, должен быть > 0
+    if (distance_multiplier !== undefined && distance_multiplier !== null) {
+      if (executor_id) {
+        throw new Error("Коэффициент дальности применяется только для штатных водителей");
+      }
+      const m = parseFloat(distance_multiplier);
+      if (isNaN(m) || m <= 0) {
+        throw new Error("Коэффициент дальности должен быть положительным числом");
+      }
+    }
 
     const customer = await Counterparty.findByPk(customer_id);
     if (!customer) {
@@ -400,6 +461,10 @@ class OrderService {
       completion_photo,
       comments: comments?.trim(),
       last_delivery_notified: false,
+      distance_multiplier: driver_id && distance_multiplier != null
+        ? parseFloat(distance_multiplier)
+        : 1.0,
+      payment_flow: executor_id ? payment_flow : "direct",
     };
 
     if (executor_id) {
@@ -407,6 +472,7 @@ class OrderService {
       orderData.executor_amount = executor_amount;
       orderData.commission_amount = commission_amount;
       orderData.payment_amount = client_amount;
+      orderData.executor_payment_method = executor_payment_method || null;
     } else {
       orderData.client_amount =
         client_amount !== undefined && client_amount !== null
@@ -415,6 +481,40 @@ class OrderService {
       orderData.executor_amount = 0;
       orderData.commission_amount = 0;
       orderData.payment_amount = orderData.client_amount;
+      orderData.executor_payment_method = null;
+    }
+
+    // Расчёт нетто-сумм после НДС
+    orderData.client_amount_net = SalaryService.calcNet(
+      orderData.client_amount,
+      payment_type,
+    );
+    orderData.executor_amount_net = SalaryService.calcNet(
+      orderData.executor_amount,
+      orderData.executor_payment_method,
+    );
+
+    // Проверка прибыльности (сценарии 4 и 5)
+    if (executor_id && executor_payment_method) {
+      const profitCheck = SalaryService.checkProfitability({
+        payment_type,
+        client_amount: orderData.client_amount,
+        executor_payment_method,
+        executor_amount: orderData.executor_amount,
+      });
+
+      if (profitCheck.isLoss && !is_loss_acknowledged) {
+        const err = new Error(profitCheck.warning);
+        err.type = "LOSS_WARNING";
+        err.details = profitCheck;
+        throw err;
+      }
+      orderData.is_loss_acknowledged = profitCheck.isLoss ? true : false;
+    }
+
+    // Получатель наличных/карты (для зарплаты)
+    if (["cash", "card_transfer"].includes(payment_type)) {
+      orderData.income_recipient_user_id = income_recipient_user_id || null;
     }
 
     const order = await Order.create(orderData);
@@ -422,29 +522,13 @@ class OrderService {
   }
 
   static async update(id, data, userId) {
-    // ============= ОТЛАДКА =============
-    console.log("\n=== UPDATE CALLED ===");
-    console.log("data:", JSON.stringify(data));
-    console.log("order.id:", id);
-    // ============= КОНЕЦ ОТЛАДКИ =============
-
     const order = await Order.findByPk(id);
     if (!order) {
       throw new Error("Заказ не найден");
     }
 
-    // ============= ПРОДОЛЖЕНИЕ ОТЛАДКИ =============
-    console.log("order.executor_amount:", order.executor_amount);
-    console.log("order.commission_amount:", order.commission_amount);
-    console.log("order.driver_id:", order.driver_id);
-    console.log("order.executor_id:", order.executor_id);
-    console.log("order.client_amount:", order.client_amount);
-    // ============= КОНЕЦ ОТЛАДКИ =============
-
-    // Нельзя изменить user_id (кто создал)
     delete data.user_id;
 
-    // ============= ПРОВЕРКА СМЕНЫ ТИПА ИСПОЛНИТЕЛЯ =============
     const newHasDriver =
       data.driver_id !== undefined
         ? data.driver_id !== null
@@ -461,7 +545,7 @@ class OrderService {
       throw new Error("Должен быть указан либо водитель, либо исполнитель");
     }
 
-    // Если меняем водителя на исполнителя
+    // Смена водителя на исполнителя
     if (newHasExecutor && !order.executor_id) {
       if (data.client_amount === undefined || data.client_amount <= 0) {
         throw new Error(
@@ -478,10 +562,7 @@ class OrderService {
           "Для назначения исполнителя необходимо указать сумму комиссии",
         );
       }
-      if (
-        data.client_amount !==
-        data.executor_amount + data.commission_amount
-      ) {
+      if (data.client_amount !== data.executor_amount + data.commission_amount) {
         throw new Error(
           "Сумма от клиента должна равняться сумме исполнителю плюс комиссия",
         );
@@ -489,7 +570,7 @@ class OrderService {
       data.driver_id = null;
     }
 
-    // Если меняем исполнителя на водителя
+    // Смена исполнителя на водителя
     if (newHasDriver && !order.driver_id) {
       data.client_amount =
         data.client_amount !== undefined ? data.client_amount : 0;
@@ -499,13 +580,13 @@ class OrderService {
       data.executor_id = null;
     }
 
-    // ============= ПРОВЕРКА СТАТУСА =============
     if (data.status) {
       const validTransitions = {
         draft: ["processing", "cancelled"],
         processing: ["assigned", "cancelled"],
         assigned: ["in_transit", "cancelled"],
-        in_transit: ["paid", "completed", "cancelled"],
+        in_transit: ["driver_done", "paid", "cancelled"],
+        driver_done: ["paid", "cancelled"],
         paid: ["completed"],
         completed: [],
         cancelled: [],
@@ -518,7 +599,6 @@ class OrderService {
       }
     }
 
-    // ============= ПРОВЕРКА СУЩЕСТВОВАНИЯ ВОДИТЕЛЯ =============
     if (data.driver_id && data.driver_id !== order.driver_id) {
       const driver = await Driver.findByPk(data.driver_id);
       if (!driver) {
@@ -526,7 +606,6 @@ class OrderService {
       }
     }
 
-    // ============= ПРОВЕРКА СУЩЕСТВОВАНИЯ ИСПОЛНИТЕЛЯ =============
     if (data.executor_id && data.executor_id !== order.executor_id) {
       const executor = await Counterparty.findByPk(data.executor_id);
       if (!executor) {
@@ -537,7 +616,6 @@ class OrderService {
       }
     }
 
-    // ============= ПРОВЕРКА ТИПА ОПЛАТЫ =============
     if (data.payment_type) {
       const validPaymentTypes = [
         "invoice_with_vat",
@@ -550,50 +628,47 @@ class OrderService {
       }
     }
 
-    // ============= ПРОВЕРКА КОМИССИОННЫХ ПОЛЕЙ =============
-    // Если обновляется только статус и нет изменений в комиссионных полях
+    if (data.distance_multiplier !== undefined && data.distance_multiplier !== null) {
+      if (newHasExecutor) {
+        throw new Error("Коэффициент дальности применяется только для штатных водителей");
+      }
+      const m = parseFloat(data.distance_multiplier);
+      if (isNaN(m) || m <= 0) {
+        throw new Error("Коэффициент дальности должен быть положительным числом");
+      }
+      data.distance_multiplier = m;
+    }
+
     const onlyStatusUpdate =
-      Object.keys(data).length === 1 &&
-      data.status !== undefined &&
-      data.client_amount === undefined &&
-      data.executor_amount === undefined &&
-      data.commission_amount === undefined;
+      Object.keys(data).length === 1 && data.status !== undefined;
 
-    console.log("onlyStatusUpdate:", onlyStatusUpdate);
-    console.log("Object.keys(data):", Object.keys(data));
-
-    if (onlyStatusUpdate) {
-      console.log(
-        "=== ПРОПУСК ПРОВЕРКИ КОМИССИОННЫХ ПОЛЕЙ (onlyStatusUpdate == true) ===",
-      );
-      // Устанавливаем флаг для пропуска валидации в модели
-      order._skipStatusValidation = true;
-    } else {
+    if (!onlyStatusUpdate) {
       const isExecutorOrder =
         (data.executor_id !== undefined && data.executor_id !== null) ||
         (order.executor_id !== null && data.executor_id !== null);
 
-      console.log("isExecutorOrder:", isExecutorOrder);
-
       if (isExecutorOrder) {
-        const newClientAmount =
+        const client =
           data.client_amount !== undefined
             ? data.client_amount
-            : order.client_amount;
-        const newExecutorAmount =
+            : Number(order.client_amount) || 0;
+        const executor =
           data.executor_amount !== undefined
             ? data.executor_amount
-            : order.executor_amount;
-        const newCommissionAmount =
+            : Number(order.executor_amount) || 0;
+
+        // Автовычисление комиссии если изменились суммы, но комиссия не передана
+        if (
+          data.commission_amount === undefined &&
+          (data.client_amount !== undefined || data.executor_amount !== undefined)
+        ) {
+          data.commission_amount = parseFloat(client) - parseFloat(executor);
+        }
+
+        const commission =
           data.commission_amount !== undefined
             ? data.commission_amount
-            : order.commission_amount;
-
-        const client = newClientAmount || 0;
-        const executor = newExecutorAmount || 0;
-        const commission = newCommissionAmount || 0;
-
-        console.log("Арифметика:", { client, executor, commission });
+            : Number(order.commission_amount) || 0;
 
         if (client !== executor + commission) {
           throw new Error(
@@ -601,62 +676,81 @@ class OrderService {
           );
         }
       } else {
-        // Заказ с водителем - комиссионные поля должны быть 0
-        console.log("=== БЛОК ДЛЯ ВОДИТЕЛЯ ===");
-        console.log("data.client_amount:", data.client_amount);
-        console.log("data.executor_amount:", data.executor_amount);
-        console.log("data.commission_amount:", data.commission_amount);
-        console.log("order.client_amount:", order.client_amount);
-        console.log("order.executor_amount:", order.executor_amount);
-        console.log("order.commission_amount:", order.commission_amount);
-
-        // Сначала приводим к 0, если не переданы
         if (data.client_amount === undefined || data.client_amount === null) {
           data.client_amount = order.client_amount || 0;
-          console.log("client_amount приведен к:", data.client_amount);
         }
-        if (
-          data.executor_amount === undefined ||
-          data.executor_amount === null
-        ) {
-          data.executor_amount = 0;
-          console.log("executor_amount приведен к:", data.executor_amount);
-        }
-        if (
-          data.commission_amount === undefined ||
-          data.commission_amount === null
-        ) {
-          data.commission_amount = 0;
-          console.log("commission_amount приведен к:", data.commission_amount);
-        }
-
-        console.log("После приведения:");
-        console.log("data.executor_amount:", data.executor_amount);
-        console.log("data.commission_amount:", data.commission_amount);
-
-        // Теперь проверяем (после приведения)
-        if (data.executor_amount !== 0) {
-          console.log(
-            "ОШИБКА: executor_amount !== 0, значение:",
-            data.executor_amount,
-          );
-          throw new Error(
-            "Для заказа с водителем компании сумма исполнителю должна быть 0",
-          );
-        }
-        if (data.commission_amount !== 0) {
-          console.log(
-            "ОШИБКА: commission_amount !== 0, значение:",
-            data.commission_amount,
-          );
-          throw new Error(
-            "Для заказа с водителем компании комиссия должна быть 0",
-          );
-        }
+        data.executor_amount = 0;
+        data.commission_amount = 0;
       }
     }
 
+    // Пересчёт нетто-сумм при изменении финансовых полей или типов оплаты
+    const effectivePaymentType = data.payment_type || order.payment_type;
+    const effectiveExecutorMethod =
+      data.executor_payment_method !== undefined
+        ? data.executor_payment_method
+        : order.executor_payment_method;
+    const effectiveClientAmount =
+      data.client_amount !== undefined
+        ? data.client_amount
+        : Number(order.client_amount);
+    const effectiveExecutorAmount =
+      data.executor_amount !== undefined
+        ? data.executor_amount
+        : Number(order.executor_amount);
+
+    if (
+      data.payment_type !== undefined ||
+      data.executor_payment_method !== undefined ||
+      data.client_amount !== undefined ||
+      data.executor_amount !== undefined
+    ) {
+      data.client_amount_net = SalaryService.calcNet(
+        effectiveClientAmount,
+        effectivePaymentType,
+      );
+      data.executor_amount_net = SalaryService.calcNet(
+        effectiveExecutorAmount,
+        effectiveExecutorMethod,
+      );
+
+      // Проверка прибыльности (сценарии 4 и 5)
+      if (newHasExecutor && effectiveExecutorMethod) {
+        const profitCheck = SalaryService.checkProfitability({
+          payment_type: effectivePaymentType,
+          client_amount: effectiveClientAmount,
+          executor_payment_method: effectiveExecutorMethod,
+          executor_amount: effectiveExecutorAmount,
+        });
+
+        if (profitCheck.isLoss && !data.is_loss_acknowledged) {
+          const err = new Error(profitCheck.warning);
+          err.type = "LOSS_WARNING";
+          err.details = profitCheck;
+          throw err;
+        }
+        data.is_loss_acknowledged = profitCheck.isLoss ? true : false;
+      }
+    }
+
+    // Обновляем получателя наличных/карты если изменился тип оплаты
+    if (data.income_recipient_user_id !== undefined) {
+      if (!["cash", "card_transfer"].includes(effectivePaymentType)) {
+        data.income_recipient_user_id = null;
+      }
+    }
+
+    if (data.status === "driver_done" && !data.driver_completed_at) {
+      data.driver_completed_at = new Date();
+    }
+
     await order.update(data);
+
+    // Начисление зарплаты при завершении заказа (сценарии 2 и 3)
+    if (data.status === "completed") {
+      await SalaryService.accrueForOrder(id, userId);
+    }
+
     return this.getById(order.id);
   }
 
@@ -952,82 +1046,96 @@ class OrderService {
       }
     }
 
-    const total = await Order.count({ where });
+    // Один запрос для агрегатов и финансовых итогов
+    const [aggregates, byStatusRows, byPaymentTypeRows] = await Promise.all([
+      Order.findOne({
+        where,
+        attributes: [
+          [sequelize.fn("COUNT", sequelize.col("id")), "total"],
+          [sequelize.fn("SUM", sequelize.col("client_amount")), "total_client_amount"],
+          [sequelize.fn("SUM", sequelize.col("executor_amount")), "total_executor_amount"],
+          [sequelize.fn("SUM", sequelize.col("commission_amount")), "total_commission"],
+          [sequelize.fn("SUM", sequelize.col("payment_amount")), "total_payment_amount"],
+          [
+            sequelize.fn("COUNT", sequelize.literal("CASE WHEN driver_id IS NOT NULL THEN 1 END")),
+            "driver_orders",
+          ],
+          [
+            sequelize.fn("COUNT", sequelize.literal("CASE WHEN executor_id IS NOT NULL THEN 1 END")),
+            "executor_orders",
+          ],
+          [
+            sequelize.fn("COUNT", sequelize.literal("CASE WHEN payment_format = 'prepaid' THEN 1 END")),
+            "prepaid_total",
+          ],
+          [
+            sequelize.fn(
+              "COUNT",
+              sequelize.literal(
+                "CASE WHEN payment_format = 'prepaid' AND prepaid_deliveries_used < prepaid_deliveries_total THEN 1 END",
+              ),
+            ),
+            "prepaid_active",
+          ],
+        ],
+        raw: true,
+      }),
 
-    const byStatus = {};
-    const statuses = [
-      "draft",
-      "processing",
-      "assigned",
-      "in_transit",
-      "paid",
-      "completed",
-      "cancelled",
-    ];
+      Order.findAll({
+        where,
+        attributes: [
+          "status",
+          [sequelize.fn("COUNT", sequelize.col("id")), "count"],
+        ],
+        group: ["status"],
+        raw: true,
+      }),
 
-    for (const status of statuses) {
-      byStatus[status] = await Order.count({
-        where: { ...where, status },
-      });
+      Order.findAll({
+        where,
+        attributes: [
+          "payment_type",
+          [sequelize.fn("COUNT", sequelize.col("id")), "count"],
+        ],
+        group: ["payment_type"],
+        raw: true,
+      }),
+    ]);
+
+    const byStatus = {
+      draft: 0, processing: 0, assigned: 0,
+      in_transit: 0, paid: 0, completed: 0, cancelled: 0,
+    };
+    for (const row of byStatusRows) {
+      byStatus[row.status] = Number(row.count);
     }
 
-    const driverOrders = await Order.count({
-      where: { ...where, driver_id: { [Op.not]: null } },
-    });
-    const executorOrders = await Order.count({
-      where: { ...where, executor_id: { [Op.not]: null } },
-    });
-
-    const totalClientAmount = await Order.sum("client_amount", { where });
-    const totalExecutorAmount = await Order.sum("executor_amount", { where });
-    const totalCommission = await Order.sum("commission_amount", { where });
-    const totalPaymentAmount = await Order.sum("payment_amount", { where });
-
     const byPaymentType = {
-      invoice_with_vat: await Order.count({
-        where: { ...where, payment_type: "invoice_with_vat" },
-      }),
-      invoice_without_vat: await Order.count({
-        where: { ...where, payment_type: "invoice_without_vat" },
-      }),
-      card_transfer: await Order.count({
-        where: { ...where, payment_type: "card_transfer" },
-      }),
-      cash: await Order.count({
-        where: { ...where, payment_type: "cash" },
-      }),
+      invoice_with_vat: 0, invoice_without_vat: 0,
+      card_transfer: 0, cash: 0,
     };
-
-    const prepaidStats = {
-      total: await Order.count({
-        where: { ...where, payment_format: "prepaid" },
-      }),
-      active: await Order.count({
-        where: {
-          ...where,
-          payment_format: "prepaid",
-          prepaid_deliveries_used: {
-            [Op.lt]: sequelize.col("prepaid_deliveries_total"),
-          },
-        },
-      }),
-    };
+    for (const row of byPaymentTypeRows) {
+      byPaymentType[row.payment_type] = Number(row.count);
+    }
 
     return {
-      total,
+      total: Number(aggregates.total) || 0,
       by_status: byStatus,
       by_type: {
-        driver_orders: driverOrders,
-        executor_orders: executorOrders,
+        driver_orders: Number(aggregates.driver_orders) || 0,
+        executor_orders: Number(aggregates.executor_orders) || 0,
       },
       financial: {
-        total_client_amount: totalClientAmount || 0,
-        total_executor_amount: totalExecutorAmount || 0,
-        total_commission: totalCommission || 0,
-        total_payment_amount: totalPaymentAmount || 0,
+        total_client_amount: Number(aggregates.total_client_amount) || 0,
+        total_executor_amount: Number(aggregates.total_executor_amount) || 0,
+        total_commission: Number(aggregates.total_commission) || 0,
+        total_payment_amount: Number(aggregates.total_payment_amount) || 0,
       },
       by_payment_type: byPaymentType,
-      prepaid: prepaidStats,
+      prepaid: {
+        total: Number(aggregates.prepaid_total) || 0,
+        active: Number(aggregates.prepaid_active) || 0,
+      },
     };
   }
 

@@ -60,14 +60,6 @@ class PriceService {
         );
       }
 
-      // Записываем в историю использования цен
-      await this.recordPriceUsage(
-        counterpartyId,
-        containerVolume,
-        effectivePaymentType,
-        price,
-      );
-
       return {
         price: parseFloat(price),
         used_payment_type: effectivePaymentType,
@@ -110,12 +102,12 @@ class PriceService {
         priceHistory = JSON.parse(priceHistory);
       }
 
-      priceHistory.push(priceHistoryEntry);
+      // Создаём новый массив (spread) чтобы Sequelize зафиксировал изменение JSONB
+      const updatedHistory = [...priceHistory, priceHistoryEntry];
 
-      // Обновляем контрагента
       await counterparty.update({
         default_prices: newPrices,
-        price_history: priceHistory,
+        price_history: updatedHistory,
       });
 
       return counterparty;
@@ -233,7 +225,7 @@ class PriceService {
    */
   static validatePriceStructure(prices) {
     const errors = [];
-    const requiredTypes = ["invoice_with_vat", "invoice_without_vat", "cash"];
+    const requiredTypes = ["invoice_with_vat", "invoice_without_vat", "card_transfer", "cash"];
     const requiredVolumes = ["8m3", "20m3", "27m3"];
 
     // Проверяем наличие всех типов оплаты
