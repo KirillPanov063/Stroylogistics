@@ -1,6 +1,13 @@
 const { User, Driver } = require("../db/models");
 const bcrypt = require("bcrypt");
 const { Op } = require("sequelize");
+const EmailService = require("./EmailService");
+
+const CODE_TTL_MINUTES = 10;
+
+function generateCode() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
 
 class UserService {
   // ============= ВАЛИДАЦИЯ =============
@@ -189,31 +196,120 @@ class UserService {
     const hashedPassword = await bcrypt.hash(password, 10);
     console.log("✅ Пароль захеширован, длина:", hashedPassword.length);
 
-    // Создаем пользователя с уже захешированным паролем
+    const code = generateCode();
+    const expiresAt = new Date(Date.now() + CODE_TTL_MINUTES * 60 * 1000);
+
+    // Создаем пользователя неактивным — активируется после подтверждения email
     const user = await User.create({
       email,
       phone,
-      password_hash: hashedPassword, // передаем готовый хеш
+      password_hash: hashedPassword,
       full_name,
       role,
+      is_active: false,
+      email_verified: false,
+      verification_code: code,
+      verification_code_expires_at: expiresAt,
     });
 
     console.log("✅ Пользователь создан, ID:", user.id);
 
-    // Если роль driver, создаем запись в drivers
-    if (role === "driver") {
-      await Driver.create({
-        full_name: full_name.trim(),
-        phone: user.phone,
-        driver_type: "company",
-        user_id: user.id,
-        is_active: true,
-      });
+    let emailSent = true;
+    try {
+      await EmailService.sendVerificationCode(user.email, user.full_name, code);
+    } catch (emailErr) {
+      console.error("❌ Ошибка отправки письма:", emailErr.message);
+      emailSent = false;
     }
 
     const result = user.get({ plain: true });
     delete result.password_hash;
+    delete result.verification_code;
+    delete result.verification_code_expires_at;
+    result.email_sent = emailSent;
     return result;
+  }
+
+  static async verifyEmail(email, code) {
+    const user = await User.findOne({
+      where: { email: email.trim().toLowerCase() },
+    });
+
+    if (!user) {
+      throw new Error("Пользователь не найден");
+    }
+
+    if (user.email_verified) {
+      throw new Error("Email уже подтверждён");
+    }
+
+    if (!user.verification_code || !user.verification_code_expires_at) {
+      throw new Error("Код подтверждения не найден. Запросите новый");
+    }
+
+    if (new Date() > new Date(user.verification_code_expires_at)) {
+      throw new Error("Код подтверждения истёк. Запросите новый");
+    }
+
+    if (user.verification_code !== String(code)) {
+      throw new Error("Неверный код подтверждения");
+    }
+
+    await user.update({
+      email_verified: true,
+      is_active: true,
+      verification_code: null,
+      verification_code_expires_at: null,
+    });
+
+    // Если роль driver, создаем запись в drivers
+    if (user.role === "driver") {
+      const existing = await Driver.findOne({ where: { user_id: user.id } });
+      if (!existing) {
+        await Driver.create({
+          full_name: user.full_name,
+          phone: user.phone,
+          driver_type: "company",
+          user_id: user.id,
+          is_active: true,
+        });
+      }
+    }
+
+    const result = user.get({ plain: true });
+    delete result.password_hash;
+    delete result.verification_code;
+    delete result.verification_code_expires_at;
+    return result;
+  }
+
+  static async resendCode(email) {
+    const user = await User.findOne({
+      where: { email: email.trim().toLowerCase() },
+    });
+
+    if (!user) {
+      throw new Error("Пользователь не найден");
+    }
+
+    if (user.email_verified) {
+      throw new Error("Email уже подтверждён");
+    }
+
+    const code = generateCode();
+    const expiresAt = new Date(Date.now() + CODE_TTL_MINUTES * 60 * 1000);
+
+    await user.update({
+      verification_code: code,
+      verification_code_expires_at: expiresAt,
+    });
+
+    try {
+      await EmailService.sendVerificationCode(user.email, user.full_name, code);
+    } catch (emailErr) {
+      console.error("❌ Ошибка повторной отправки письма:", emailErr.message);
+      throw new Error("Код обновлён, но письмо не удалось отправить. Проверьте настройки SMTP");
+    }
   }
 
   // * Вход пользователя (signIn)
@@ -266,10 +362,14 @@ class UserService {
       throw new Error("Неверный пароль");
     }
 
+    if (!user.email_verified) {
+      const err = new Error("Email не подтверждён. Проверьте почту и введите код подтверждения");
+      err.code = "EMAIL_NOT_VERIFIED";
+      throw err;
+    }
+
     if (!user.is_active) {
-      throw new Error(
-        "Пользователь деактивирован. Обратитесь к администратору",
-      );
+      throw new Error("Пользователь деактивирован. Обратитесь к администратору");
     }
 
     // Возвращаем пользователя с паролем! (удалим в контроллере)

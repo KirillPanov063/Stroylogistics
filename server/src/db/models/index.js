@@ -220,6 +220,28 @@ if (db.Order) {
     as: "child_orders",
   });
 
+  // Order → WasteReceiver (полигон сгрузки)
+  if (db.WasteReceiver) {
+    db.Order.belongsTo(db.WasteReceiver, {
+      foreignKey: "waste_receiver_id",
+      as: "waste_receiver",
+      onDelete: "SET NULL",
+    });
+    db.WasteReceiver.hasMany(db.Order, {
+      foreignKey: "waste_receiver_id",
+      as: "orders",
+    });
+  }
+
+  // Order → WasteReceiverAddress (адрес полигона)
+  if (db.WasteReceiverAddress) {
+    db.Order.belongsTo(db.WasteReceiverAddress, {
+      foreignKey: "waste_receiver_address_id",
+      as: "waste_receiver_address",
+      onDelete: "SET NULL",
+    });
+  }
+
   console.log("✅ Ассоциации Order настроены");
 }
 
@@ -297,7 +319,78 @@ if (db.Document) {
   console.log("✅ Ассоциации Document настроены");
 }
 
-// ============= ДОПОЛНИТЕЛЬНЫЕ АССОЦИАЦИИ ДЛЯ РАБОТЫ С ДОКУМЕНТАМИ =============
+// ============= АССОЦИАЦИИ ДЛЯ WASTE_RECEIVERS =============
+
+if (db.WasteReceiver && db.WasteReceiverAddress) {
+  db.WasteReceiver.hasMany(db.WasteReceiverAddress, {
+    foreignKey: "waste_receiver_id",
+    as: "addresses",
+    onDelete: "CASCADE",
+  });
+
+  db.WasteReceiverAddress.belongsTo(db.WasteReceiver, {
+    foreignKey: "waste_receiver_id",
+    as: "waste_receiver",
+  });
+  console.log("✅ Ассоциации WasteReceiver настроены");
+}
+
+if (db.WasteReceiver && db.Document) {
+  db.WasteReceiver.hasMany(db.Document, {
+    foreignKey: "waste_receiver_id",
+    as: "documents",
+    onDelete: "SET NULL",
+  });
+
+  db.Document.belongsTo(db.WasteReceiver, {
+    foreignKey: "waste_receiver_id",
+    as: "waste_receiver",
+    onDelete: "SET NULL",
+  });
+}
+
+// ============= АССОЦИАЦИИ ДЛЯ SALARY_ACCRUALS =============
+
+if (db.SalaryAccrual) {
+  if (db.User) {
+    db.SalaryAccrual.belongsTo(db.User, {
+      foreignKey: "user_id",
+      as: "employee",
+      onDelete: "RESTRICT",
+    });
+    db.User.hasMany(db.SalaryAccrual, {
+      foreignKey: "user_id",
+      as: "salary_accruals",
+    });
+
+    db.SalaryAccrual.belongsTo(db.User, {
+      foreignKey: "accrued_by",
+      as: "accrued_by_user",
+      onDelete: "SET NULL",
+    });
+  }
+
+  if (db.Order) {
+    db.SalaryAccrual.belongsTo(db.Order, {
+      foreignKey: "order_id",
+      as: "order",
+      onDelete: "RESTRICT",
+    });
+    db.Order.hasOne(db.SalaryAccrual, {
+      foreignKey: "order_id",
+      as: "salary_accrual",
+    });
+
+    // Order → User (получатель наличных/карты)
+    db.Order.belongsTo(db.User, {
+      foreignKey: "income_recipient_user_id",
+      as: "income_recipient",
+      onDelete: "SET NULL",
+    });
+  }
+
+  console.log("✅ Ассоциации SalaryAccrual настроены");
+}
 
 console.log("🎉 Все модели успешно загружены и ассоциированы");
 

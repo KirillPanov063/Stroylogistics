@@ -42,6 +42,8 @@ indexRouter.use("/drivers", driverRouter); // /api/drivers - управлени�
 indexRouter.use("/prices", priceRouter); // /api/prices - управление ценами контрагентов
 indexRouter.use("/executor-invoices", executorInvoiceRouter); // /api/executor-invoices - счета от исполнителей
 indexRouter.use("/documents", documentRouter); // /api/documents - управление документами
+indexRouter.use("/salary", require("./salary.routes")); // /api/salary - начисления зарплаты
+indexRouter.use("/waste-receivers", require("./wasteReceiver.routes")); // /api/waste-receivers - компании-приёмщики мусора
 
 // Health check - проверка работоспособности сервера
 indexRouter.get("/health", (req, res) => {

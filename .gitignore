@@ -1,0 +1,33 @@
+# Зависимости
+node_modules/
+
+# Файлы окружения (содержат секреты — никогда не коммитить!)
+.env
+.env.local
+.env.production
+.env.*.local
+
+# Логи
+logs/
+*.log
+
+# Директории сборки
+dist/
+build/
+coverage/
+
+# Загруженные файлы
+uploads/
+
+# Временные файлы
+tmp/
+temp/
+*.tmp
+
+# IDE
+.vscode/
+.idea/
+
+# ОС
+.DS_Store
+Thumbs.db

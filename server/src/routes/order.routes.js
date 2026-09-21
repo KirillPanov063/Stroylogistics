@@ -1,10 +1,32 @@
 const router = require("express").Router();
+const path = require("path");
+const multer = require("multer");
 const OrderController = require("../controllers/OrderController");
 const {
   authenticateToken,
   authorizeRoles,
 } = require("../middleware/verifyAccessToken");
 const checkBody = require("../middleware/checkBody");
+
+const photoStorage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, path.join(__dirname, "../uploads/photos")),
+  filename: (req, file, cb) => {
+    const unique = Date.now() + "-" + Math.round(Math.random() * 1e9);
+    cb(null, unique + path.extname(file.originalname));
+  },
+});
+
+const photoUpload = multer({
+  storage: photoStorage,
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (["image/jpeg", "image/png", "image/webp"].includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error("Разрешены только изображения (JPEG, PNG, WebP)"), false);
+    }
+  },
+});
 
 // Все маршруты требуют аутентификации
 router.use(authenticateToken);
@@ -78,6 +100,17 @@ router.patch(
   "/:id/executor",
   authorizeRoles("admin", "manager"),
   OrderController.assignExecutor,
+);
+
+// Отчёт водителя о выполнении (фото + номера контейнеров → статус driver_done)
+router.post(
+  "/:id/driver-report",
+  authorizeRoles("admin", "manager", "driver"),
+  photoUpload.fields([
+    { name: "photo", maxCount: 1 },
+    { name: "waybill_photo", maxCount: 1 },
+  ]),
+  OrderController.submitDriverReport,
 );
 
 // Добавление фото выполнения

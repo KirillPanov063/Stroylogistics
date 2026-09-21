@@ -17,11 +17,13 @@ class OrderController {
         payment_type: req.query.paymentType,
         date_from: req.query.dateFrom,
         date_to: req.query.dateTo,
+        page: req.query.page,
+        limit: req.query.limit,
       };
 
-      const orders = await OrderService.getAll(filters);
+      const result = await OrderService.getAll(filters);
 
-      res.json(formatResponse.success("Заказы получены", orders));
+      res.json(formatResponse.success("Заказы получены", result));
     } catch (error) {
       console.error("Ошибка получения заказов:", error);
       res
@@ -178,16 +180,24 @@ class OrderController {
 
       res.status(201).json(formatResponse.created("Заказ создан", order));
     } catch (error) {
-      console.error("Ошибка создания заказа:", error);
+      // Предупреждение об убыточной операции (сценарии 4 и 5)
+      if (error.type === "LOSS_WARNING") {
+        return res.status(422).json({
+          success: false,
+          type: "LOSS_WARNING",
+          message: error.message,
+          details: error.details,
+          hint: "Отправьте запрос повторно с полем is_loss_acknowledged: true для подтверждения",
+        });
+      }
 
-      let statusCode = 500;
-      if (
+      console.error("Ошибка создания заказа:", error);
+      const statusCode =
         error.message.includes("обязателен") ||
         error.message.includes("Некорректный") ||
         error.message.includes("не найден")
-      ) {
-        statusCode = 400;
-      }
+          ? 400
+          : 500;
 
       res
         .status(statusCode)
@@ -271,16 +281,24 @@ class OrderController {
 
       res.json(formatResponse.success("Заказ обновлен", updated));
     } catch (error) {
-      console.error("Ошибка обновления заказа:", error);
+      // Предупреждение об убыточной операции (сценарии 4 и 5)
+      if (error.type === "LOSS_WARNING") {
+        return res.status(422).json({
+          success: false,
+          type: "LOSS_WARNING",
+          message: error.message,
+          details: error.details,
+          hint: "Отправьте запрос повторно с полем is_loss_acknowledged: true для подтверждения",
+        });
+      }
 
-      let statusCode = 500;
-      if (
+      console.error("Ошибка обновления заказа:", error);
+      const statusCode =
         error.message.includes("Невозможно изменить статус") ||
         error.message.includes("некорректный") ||
         error.message.includes("должен быть указан")
-      ) {
-        statusCode = 400;
-      }
+          ? 400
+          : 500;
 
       res
         .status(statusCode)
@@ -738,6 +756,123 @@ class OrderController {
       res
         .status(statusCode)
         .json(formatResponse.error(error.message, null, statusCode));
+    }
+  }
+
+  // * Отчёт водителя о выполнении заказа
+  static async submitDriverReport(req, res) {
+    try {
+      const { id } = req.params;
+      const { installed_container_number, picked_up_container_number, waste_receiver_id, waste_receiver_address_id } = req.body;
+      const photoFile = req.files?.["photo"]?.[0];
+      const waybillFile = req.files?.["waybill_photo"]?.[0];
+
+      const order = await OrderService.getById(id);
+      if (!order) {
+        return res.status(404).json(formatResponse.notFound("Заказ не найден"));
+      }
+
+      if (order.status !== "in_transit") {
+        return res.status(400).json(
+          formatResponse.error(`Отчёт можно отправить только для заказа в статусе 'в пути', текущий статус: ${order.status}`)
+        );
+      }
+
+      if (!order.driver_id) {
+        return res.status(400).json(
+          formatResponse.error("Отчёт водителя доступен только для заказов со штатным водителем")
+        );
+      }
+
+      const action = order.container_action;
+
+      // Валидация по типу действия
+      if (action === "pickup") {
+        if (!picked_up_container_number) {
+          return res.status(400).json(
+            formatResponse.error("Укажите номер забранного контейнера")
+          );
+        }
+        if (!photoFile) {
+          return res.status(400).json(
+            formatResponse.error("Прикрепите фото выполнения")
+          );
+        }
+      } else if (action === "install") {
+        if (!installed_container_number) {
+          return res.status(400).json(
+            formatResponse.error("Укажите номер установленного контейнера")
+          );
+        }
+        if (!photoFile) {
+          return res.status(400).json(
+            formatResponse.error("Прикрепите фото выполнения")
+          );
+        }
+      } else if (action === "loading" || action === "roll") {
+        if (!photoFile) {
+          return res.status(400).json(
+            formatResponse.error("Прикрепите фото выполнения")
+          );
+        }
+      } else if (action === "replace") {
+        if (!installed_container_number || !picked_up_container_number) {
+          return res.status(400).json(
+            formatResponse.error("Укажите номера установленного и забранного контейнеров")
+          );
+        }
+        if (!photoFile) {
+          return res.status(400).json(
+            formatResponse.error("Прикрепите фото выполнения")
+          );
+        }
+      }
+
+      // Для загрузки, забора и замены — полигон обязателен
+      const needsWasteReceiver = ["loading", "pickup", "replace", "roll"].includes(action);
+      if (needsWasteReceiver && !waste_receiver_id) {
+        return res.status(400).json(
+          formatResponse.error("Укажите полигон сгрузки")
+        );
+      }
+
+      // Для юр. лиц с оплатой по счёту — накладная обязательна
+      const isLegalEntity = ["llc", "entrepreneur"].includes(order.customer?.person_type);
+      const isInvoice = ["invoice_with_vat", "invoice_without_vat"].includes(order.payment_type);
+      if (isLegalEntity && isInvoice && !waybillFile) {
+        return res.status(400).json(
+          formatResponse.error("Для юридического лица с оплатой по счёту необходимо прикрепить фото накладной")
+        );
+      }
+
+      const updateData = { status: "driver_done" };
+
+      if (installed_container_number) {
+        updateData.installed_container_number = installed_container_number;
+      }
+      if (picked_up_container_number) {
+        updateData.picked_up_container_number = picked_up_container_number;
+      }
+      if (photoFile) {
+        updateData.completion_photo = photoFile.path;
+      }
+      if (waybillFile) {
+        updateData.waybill_photo = waybillFile.path;
+      }
+      if (waste_receiver_id) {
+        updateData.waste_receiver_id = waste_receiver_id;
+        updateData.waste_receiver_address_id = waste_receiver_address_id || null;
+      }
+
+      const userId = res.locals.user.id;
+      const updated = await OrderService.update(id, updateData, userId);
+
+      res.json(formatResponse.success("Отчёт о выполнении принят", updated));
+    } catch (error) {
+      console.error("Ошибка отчёта водителя:", error);
+      res.status(500).json(
+        formatResponse.serverError("Не удалось сохранить отчёт", error.message)
+      );
     }
   }
 
